@@ -25,33 +25,63 @@ def validate_silence(ctx, param, value):
     except ValueError:
         raise click.BadParameter("Silence must be 'full' or an integer between 1 and 100")
 
-def split_audio(audio, sr, max_minutes):
-    """Split audio into segments if longer than max_minutes"""
-    max_samples = int(max_minutes * 60 * sr)
-    if len(audio) <= max_samples:
+def find_silence_points(audio: np.ndarray, sr: int, min_silence_len: float = 0.3, silence_thresh: float = -40) -> List[int]:
+    """Find silence points in audio that can be used as split points"""
+    
+    # Convert to mono if stereo
+    if len(audio.shape) > 1:
+        audio = audio.mean(axis=1)
+    
+    # Calculate frame length for minimum silence length
+    frame_length = int(sr * min_silence_len)
+    hop_length = frame_length // 4
+    
+    # Calculate RMS energy for each frame
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    
+    # Convert to dB
+    db = librosa.amplitude_to_db(rms)
+    
+    # Find silence frames
+    silence_frames = np.where(db < silence_thresh)[0]
+    
+    # Convert frame indices to sample indices
+    silence_points = silence_frames * hop_length
+    
+    # Remove points that are too close to the start or end
+    silence_points = silence_points[
+        (silence_points > sr) & (silence_points < len(audio) - sr)
+    ]
+    
+    return sorted(list(silence_points))
+
+def split_audio(audio: np.ndarray, sr: int, max_length: float) -> List[np.ndarray]:
+    """Split audio into segments at silence points"""
+    if len(audio) / sr <= max_length:
         return [audio]
     
-    # Find silence points for better splitting
-    from librosa.effects import split
-    intervals = split(audio, top_db=30)
+    max_samples = int(max_length * sr)
+    silence_points = find_silence_points(audio, sr)
+    
+    if not silence_points:
+        # If no silence points found, split at max_length
+        return np.array_split(audio, np.ceil(len(audio) / max_samples))
     
     segments = []
-    current_segment = []
-    current_length = 0
+    start = 0
     
-    for start, end in intervals:
-        interval_audio = audio[start:end]
-        if current_length + len(interval_audio) <= max_samples:
-            current_segment.append(interval_audio)
-            current_length += len(interval_audio)
+    while start < len(audio):
+        # Find the best silence point within max_length
+        end_target = start + max_samples
+        suitable_points = [p for p in silence_points if start < p <= end_target]
+        
+        if suitable_points:
+            end = suitable_points[-1]
         else:
-            if current_segment:
-                segments.append(np.concatenate(current_segment))
-            current_segment = [interval_audio]
-            current_length = len(interval_audio)
-    
-    if current_segment:
-        segments.append(np.concatenate(current_segment))
+            end = min(end_target, len(audio))
+        
+        segments.append(audio[start:end])
+        start = end
     
     return segments
 
@@ -90,7 +120,8 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
             audio = np.stack([audio, audio])
         
         # Split audio if needed
-        segments = split_audio(audio, sr, max_minutes)
+        max_length = max_minutes * 60  # Convert to seconds
+        segments = split_audio(audio, sr, max_length)
         logger.info(f"Processing {len(segments)} segments...")
         
         # Process each segment
@@ -138,6 +169,3 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}")
         raise click.ClickException(str(e))
-
-if __name__ == '__main__':
-    main()
