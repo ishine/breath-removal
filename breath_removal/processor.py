@@ -47,12 +47,84 @@ def feature_extractor(wav, sr=16000):
     length = torch.tensor([zcr.shape[-1]])
     return feature, length
 
+import numpy as np
+import librosa
+import soundfile as sf
+from pathlib import Path
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Union, Optional
+from intervaltree import Interval, IntervalTree
+import logging
+import torch
+
+logger = logging.getLogger(__name__)
+
+def find_silence_points(audio: np.ndarray, sr: int, min_silence_len: float = 0.3, silence_thresh: float = -40) -> List[int]:
+    """Find silence points in audio that can be used as split points"""
+    
+    # Convert to mono if stereo
+    if len(audio.shape) > 1:
+        audio = audio.mean(axis=1)
+    
+    # Calculate frame length for minimum silence length
+    frame_length = int(sr * min_silence_len)
+    hop_length = frame_length // 4
+    
+    # Calculate RMS energy for each frame
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    
+    # Convert to dB
+    db = librosa.amplitude_to_db(rms)
+    
+    # Find silence frames
+    silence_frames = np.where(db < silence_thresh)[0]
+    
+    # Convert frame indices to sample indices
+    silence_points = silence_frames * hop_length
+    
+    # Remove points that are too close to the start or end
+    silence_points = silence_points[
+        (silence_points > sr) & (silence_points < len(audio) - sr)
+    ]
+    
+    return sorted(list(silence_points))
+
+def split_audio(audio: np.ndarray, sr: int, max_length: float) -> List[np.ndarray]:
+    """Split audio into segments at silence points"""
+    if len(audio) / sr <= max_length:
+        return [audio]
+    
+    max_samples = int(max_length * sr)
+    silence_points = find_silence_points(audio, sr)
+    
+    if not silence_points:
+        # If no silence points found, split at max_length
+        return np.array_split(audio, np.ceil(len(audio) / max_samples))
+    
+    segments = []
+    start = 0
+    
+    while start < len(audio):
+        # Find the best silence point within max_length
+        end_target = start + max_samples
+        suitable_points = [p for p in silence_points if start < p <= end_target]
+        
+        if suitable_points:
+            end = suitable_points[-1]
+        else:
+            end = min(end_target, len(audio))
+        
+        segments.append(audio[start:end])
+        start = end
+    
+    return segments
+
 class AudioProcessor:
     def __init__(self, detector, sr=22050, channels=1):
         self.detector = detector
         self.sr = sr
         self.channels = channels
-        
+
     def process_file(
         self,
         input_file: str,
@@ -115,7 +187,7 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Error in process_file: {str(e)}")
             return False
-    
+
     def _silence_breaths(
         self,
         audio: np.ndarray,
