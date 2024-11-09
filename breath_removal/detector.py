@@ -1,7 +1,107 @@
+import numpy as np
+import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.models import Conformer
+from intervaltree import Interval, IntervalTree
+import os
+from pathlib import Path
+import logging
+import requests
+from tqdm import tqdm
+import tempfile
+
+logger = logging.getLogger(__name__)
+
+MODEL_URL = "https://huggingface.co/DongYANG/Respiro-en/resolve/main/respiro-en.pt"
+MODELS_DIR = Path.home() / ".breath_removal" / "models"
+
+def download_model(force: bool = False) -> Path:
+    """Download the Respiro-en model if not present."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = MODELS_DIR / "respiro-en.pt"
+    
+    if model_path.exists() and not force:
+        logger.info(f"Model already exists at {model_path}")
+        return model_path
+        
+    logger.info("Downloading Respiro-en model...")
+    
+    # Stream download with progress bar
+    response = requests.get(MODEL_URL, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(model_path, 'wb') as f, tqdm(
+        desc="Downloading model",
+        total=total_size,
+        unit='iB',
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as pbar:
+        for data in response.iter_content(chunk_size=1024):
+            size = f.write(data)
+            pbar.update(size)
+            
+    logger.info(f"Model downloaded to {model_path}")
+    return model_path
+
+def zcr_extractor(wav, win_length, hop_length):
+    """Extract zero-crossing rate feature."""
+    pad_length = win_length // 2
+    wav = np.pad(wav, (pad_length, pad_length), 'constant')
+    num_frames = 1 + (wav.shape[0] - win_length) // hop_length
+    zcrs = np.zeros(num_frames)
+    
+    for i in range(num_frames):
+        start = i * hop_length
+        end = start + win_length
+        zcr = np.abs(np.sign(wav[start+1:end]) - np.sign(wav[start:end-1]))
+        zcr = np.sum(zcr) * 0.5 / win_length
+        zcrs[i] = zcr
+        
+    return zcrs.astype(np.float32)
+
+def feature_extractor(wav, sr=16000):
+    """Extract mel spectrogram, ZCR and variance features."""
+    # Ensure audio is float32 and normalized
+    wav = wav.astype(np.float32)
+    if wav.max() > 1.0 or wav.min() < -1.0:
+        wav = wav / max(abs(wav.max()), abs(wav.min()))
+    
+    # Extract mel spectrogram
+    mel = librosa.feature.melspectrogram(
+        y=wav, sr=sr, 
+        n_fft=int(sr*0.025), 
+        hop_length=int(sr*0.01), 
+        n_mels=128
+    )
+    mel = librosa.power_to_db(mel, ref=np.max)
+    
+    # Extract ZCR
+    zcr = zcr_extractor(
+        wav, 
+        win_length=int(sr*0.025), 
+        hop_length=int(sr*0.01)
+    )
+    
+    # Calculate variance
+    vms = np.var(mel, axis=0)
+
+    # Convert to tensors
+    mel = torch.tensor(mel).unsqueeze(0)
+    zcr = torch.tensor(zcr).unsqueeze(0)
+    vms = torch.tensor(vms).unsqueeze(0)
+
+    # Match dimensions
+    zcr = zcr.unsqueeze(1).expand(-1, 128, -1)
+    vms = torch.var(mel, dim=1).unsqueeze(1).expand(-1, mel.shape[1], -1)
+
+    # Stack features
+    feature = torch.stack((mel, vms, zcr), dim=1)
+    length = torch.tensor([zcr.shape[-1]])
+    
+    return feature, length
 
 class Conv2dDownsampling(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
@@ -85,6 +185,7 @@ class DetectionNet(nn.Module):
 
 class BreathDetector:
     def __init__(self, model_path=None, device=None):
+        """Initialize breath detector with optional model path."""
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -92,8 +193,56 @@ class BreathDetector:
             
         self.model = DetectionNet().to(self.device)
         
-        if model_path:
-            checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint["model"])
-        
+        if model_path is None:
+            model_path = download_model()
+            
+        logger.info(f"Loading model from {model_path}")
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
+
+    def detect_breaths(self, audio: np.ndarray, sr: int, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
+        """Detect breath segments in audio array."""
+        # Create temporary 16kHz version for detection
+        if sr != 16000:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_file:
+                # Save temporary file at 16kHz
+                temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+                feature, length = feature_extractor(temp_audio, sr=16000)
+        else:
+            feature, length = feature_extractor(audio, sr=16000)
+            
+        feature, length = feature.to(self.device), length.to(self.device)
+        
+        with torch.no_grad():
+            output = self.model(feature, length)
+        
+        # Process predictions
+        prediction = (output[0] > threshold).nonzero().squeeze().tolist()
+        tree = IntervalTree()
+        
+        if isinstance(prediction, list) and len(prediction) > 1:
+            diffs = np.diff(prediction)
+            splits = np.where(diffs != 1)[0] + 1
+            splits = np.split(prediction, splits)
+            splits = list(filter(lambda split: len(split) > min_length, splits))
+            
+            # Convert frame indices to time and create intervals
+            for split in splits:
+                if len(split) > 0:
+                    # Convert frame indices to seconds, adjusting for original sample rate
+                    start_time = split[0] * 0.01 * (sr / 16000)
+                    end_time = split[-1] * 0.01 * (sr / 16000)
+                    if end_time > start_time:
+                        tree.add(Interval(
+                            round(start_time, 2),
+                            round(end_time, 2)
+                        ))
+        
+        return tree
+
+    def __call__(self, wav_path: str, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
+        """Detect breaths in audio file."""
+        # Load audio at its original sample rate
+        audio, sr = librosa.load(wav_path, sr=None)
+        return self.detect_breaths(audio, sr, threshold, min_length)

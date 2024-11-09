@@ -136,7 +136,8 @@ class AudioProcessor:
         plot: bool = False
     ) -> bool:
         try:
-            # Load audio
+            # Load audio at target sample rate and convert to mono if needed
+            logger.info(f"Loading audio file {input_file} at {sr}Hz...")
             audio, file_sr = librosa.load(input_file, sr=sr, mono=(channels == 1))
             
             # Split audio if needed
@@ -145,47 +146,49 @@ class AudioProcessor:
             logger.info(f"Processing {len(segments)} segments...")
             
             processed_segments = []
+            current_offset = 0.0
+            
             for i, segment in enumerate(segments):
                 logger.info(f"Processing segment {i+1}/{len(segments)}...")
                 
-                # Process breath detection on segment
-                features, length = feature_extractor(segment)
-                features = features.to(self.detector.device)
-                length = length.to(self.detector.device)
+                # Detect breaths - internally handles resampling for detection
+                breath_segments = self.detector.detect_breaths(segment, sr)
                 
-                with torch.no_grad():
-                    output = self.detector.model(features, length)
+                # Adjust breath segments for current segment offset
+                adjusted_segments = []
+                for interval in sorted(breath_segments):
+                    start = interval.begin + current_offset
+                    end = interval.end + current_offset
+                    adjusted_segments.append((start, end))
                 
-                # Process breaths in segment
-                threshold = 0.064
-                prediction = (output[0] > threshold).nonzero().cpu().numpy()
+                # Process breaths
+                processed_segment = self._silence_breaths(segment, adjusted_segments, silence_level)
                 
-                if len(prediction) > 0:
-                    # Group consecutive frames
-                    breaks = np.where(np.diff(prediction[:, 0]) > 1)[0] + 1
-                    breath_segments = np.split(prediction[:, 0], breaks)
-                    
-                    # Convert to time segments
-                    breath_times = []
-                    for breath_segment in breath_segments:
-                        if len(breath_segment) > 20:  # minimum length threshold
-                            start = breath_segment[0] * 0.01
-                            end = breath_segment[-1] * 0.01
-                            breath_times.append((start, end))
-                            
-                    # Process breaths
-                    segment = self._silence_breaths(segment, breath_times, silence_level)
-                    
-                processed_segments.append(segment)
+                # Generate plot if requested
+                if plot:
+                    self._plot_analysis(
+                        segment,
+                        adjusted_segments,
+                        str(Path(output_file).with_suffix('')) + f"_segment_{i+1}.png",
+                        current_offset
+                    )
                 
-            # Concatenate and save
+                processed_segments.append(processed_segment)
+                current_offset += len(segment) / sr
+            
+            # Concatenate processed segments
             final_audio = np.concatenate(processed_segments)
+            
+            # Save output as WAV
+            logger.info(f"Saving processed audio to {output_file}...")
             sf.write(output_file, final_audio, sr)
             
             return True
             
         except Exception as e:
             logger.error(f"Error in process_file: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     def _silence_breaths(
@@ -198,77 +201,93 @@ class AudioProcessor:
         processed_audio = audio.copy()
         reduction_factor = 0 if silence_level == 'full' else (1 - silence_level/100)
         
-        # Skip processing if no valid breath segments
+        # Debug logging - add this
+        logger.info(f"Processing {len(breath_segments)} breath segments with reduction factor {reduction_factor}")
+        
         if not breath_segments:
             return processed_audio
-            
+        
         for start, end in breath_segments:
-            # Convert time to samples
-            start_sample = max(0, int(start * self.sr))
-            end_sample = min(len(processed_audio), int(end * self.sr))
+            start_sample = int(start * self.sr)
+            end_sample = min(int(end * self.sr), len(processed_audio))
             
-            # Skip if segment is invalid
             if start_sample >= end_sample or start_sample >= len(processed_audio):
                 continue
-                
-            # Calculate fade length based on segment duration
-            segment_length = end_sample - start_sample
-            fade_samples = min(int(0.01 * self.sr), segment_length // 4)
             
-            # Skip if segment is too short for processing
-            if segment_length <= 2:
-                continue
+            fade_samples = min(int(0.01 * self.sr), (end_sample - start_sample) // 4)
+            
+            if fade_samples > 0:
+                # Create fade curves
+                fade_out = np.linspace(1, reduction_factor, fade_samples)
+                fade_in = np.linspace(reduction_factor, 1, fade_samples)
                 
-            try:
-                if fade_samples > 0:
-                    # Create fade curves
-                    fade_out = np.linspace(1, reduction_factor, fade_samples)
-                    fade_in = np.linspace(reduction_factor, 1, fade_samples)
-                    
+                # Apply fades
+                try:
                     # Apply fade out
-                    processed_audio[start_sample:start_sample + fade_samples] *= fade_out
+                    if start_sample + fade_samples <= len(processed_audio):
+                        processed_audio[start_sample:start_sample + fade_samples] *= fade_out
                     
-                    # Apply reduction to middle part if there is one
-                    if start_sample + fade_samples < end_sample - fade_samples:
-                        processed_audio[start_sample + fade_samples:end_sample - fade_samples] *= reduction_factor
+                    # Apply reduction to middle section
+                    middle_start = start_sample + fade_samples
+                    middle_end = end_sample - fade_samples
+                    if middle_start < middle_end:
+                        processed_audio[middle_start:middle_end] *= reduction_factor
                     
                     # Apply fade in
-                    if end_sample - fade_samples > start_sample:
+                    if end_sample - fade_samples >= 0:
                         processed_audio[end_sample - fade_samples:end_sample] *= fade_in
-                else:
-                    # For very short segments, simple reduction
-                    processed_audio[start_sample:end_sample] *= reduction_factor
+                        
+                    # Debug logging - add this
+                    logger.info(f"Processed segment {start:.2f}s-{end:.2f}s")
                     
-            except ValueError as e:
-                logger.warning(f"Skipping problematic breath segment {start:.2f}s-{end:.2f}s: {str(e)}")
-                continue
+                except Exception as e:
+                    logger.warning(f"Error processing segment {start:.2f}s-{end:.2f}s: {str(e)}")
+                    continue
+            else:
+                # Simple reduction for very short segments
+                processed_audio[start_sample:end_sample] *= reduction_factor
         
         return processed_audio
-    
+            
     def _plot_analysis(
         self,
         audio: np.ndarray,
         breath_segments: List[Tuple[float, float]],
-        output_path: str
+        output_path: str,
+        segment_offset: float = 0.0
     ) -> None:
+        """Generate visualization of audio with breath markers"""
         plt.figure(figsize=(15, 5))
         
-        time = np.linspace(0, len(audio)/self.sr, len(audio))
+        # Calculate time array with offset
+        duration = len(audio) / self.sr
+        time = np.linspace(segment_offset, segment_offset + duration, len(audio))
+        
+        # Plot waveform
         plt.plot(time, audio, color='blue', alpha=0.6, linewidth=1)
         
+        # Plot breath segments
         for start, end in breath_segments:
-            plt.axvspan(start, end, color='red', alpha=0.3, label='Breath')
+            # Only plot segments that fall within this segment's time range
+            if start >= segment_offset and start < (segment_offset + duration):
+                plt.axvspan(start, end, color='red', alpha=0.3, label='Breath')
         
-        plt.title("Waveform Analysis with Breath Segments")
+        plt.title(f"Waveform Analysis ({segment_offset:.1f}s - {segment_offset + duration:.1f}s)")
         plt.xlabel('Time (seconds)')
         plt.ylabel('Amplitude')
         plt.grid(True, alpha=0.3)
         
-        if breath_segments:
-            handles, labels = plt.gca().get_legend_handles_labels()
+        # Add legend if there are breath segments
+        handles, labels = plt.gca().get_legend_handles_labels()
+        if handles:
             by_label = dict(zip(labels, handles))
             plt.legend(by_label.values(), by_label.keys())
         
-        plot_path = str(Path(output_path).with_suffix('')) + "_analysis.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        # Set x-axis limits
+        plt.xlim(segment_offset, segment_offset + duration)
+        
+        # Save plot
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
+        
+        logger.info(f"Saved analysis plot to {output_path}")
