@@ -201,11 +201,21 @@ class BreathDetector:
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
 
-    def detect_breaths(self, audio: np.ndarray, sr: int):
-        """Detect breath segments in audio array."""
-        # Always resample to 16kHz for detection
-        temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+    def detect_breaths(self, audio: np.ndarray, sr: int, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
+        """Detect breath segments in audio array.
         
+        Args:
+            audio: Input audio array
+            sr: Sample rate
+            threshold: Detection threshold (default: 0.064 from paper)
+            min_length: Minimum breath segment length in frames (default: 20)
+        """
+        # Resample to 16kHz for detection
+        if sr != 16000:
+            temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        else:
+            temp_audio = audio
+
         feature, length = feature_extractor(temp_audio, sr=16000)
         feature, length = feature.to(self.device), length.to(self.device)
         
@@ -224,7 +234,8 @@ class BreathDetector:
             hop_length = int(16000 * 0.01)  # 10ms hop length at 16kHz
             for split in splits:
                 if len(split) > 0:
-                    start_time = split[0] * hop_length / 16000  # Convert to seconds
+                    # Convert frame indices to time in seconds
+                    start_time = split[0] * hop_length / 16000
                     end_time = split[-1] * hop_length / 16000
                     
                     tree.add(Interval(
@@ -233,8 +244,15 @@ class BreathDetector:
                     ))
         
         return tree
+        
     def __call__(self, wav_path: str, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
-        """Detect breaths in audio file."""
+        """Detect breaths in audio file.
+        
+        Args:
+            wav_path: Path to audio file
+            threshold: Detection threshold (default: 0.064)
+            min_length: Minimum breath segment length in frames (default: 20)
+        """
         # Load audio at its original sample rate
         audio, sr = librosa.load(wav_path, sr=None)
         return self.detect_breaths(audio, sr, threshold, min_length)
