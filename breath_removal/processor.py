@@ -136,12 +136,11 @@ class AudioProcessor:
         plot: bool = False
     ) -> bool:
         try:
-            # Load audio at target sample rate and convert to mono if needed
-            logger.info(f"Loading audio file {input_file} at {sr}Hz...")
+            # Load audio
             audio, file_sr = librosa.load(input_file, sr=sr, mono=(channels == 1))
             
             # Split audio if needed
-            max_length = max_minutes * 60  # Convert to seconds
+            max_length = max_minutes * 60
             segments = split_audio(audio, sr, max_length)
             logger.info(f"Processing {len(segments)} segments...")
             
@@ -151,24 +150,24 @@ class AudioProcessor:
             for i, segment in enumerate(segments):
                 logger.info(f"Processing segment {i+1}/{len(segments)}...")
                 
-                # Detect breaths - internally handles resampling for detection
-                breath_segments = self.detector.detect_breaths(segment, sr)
+                # Get breath segments
+                breath_tree = self.detector.detect_breaths(segment, sr)
                 
-                # Adjust breath segments for current segment offset
-                adjusted_segments = []
-                for interval in sorted(breath_segments):
+                # Convert tree to list of tuples and adjust for segment offset
+                breath_segments = []
+                for interval in sorted(breath_tree):
                     start = interval.begin + current_offset
                     end = interval.end + current_offset
-                    adjusted_segments.append((start, end))
+                    breath_segments.append((start, end))
+                    logger.debug(f"Detected breath: {start:.3f}s-{end:.3f}s")
                 
                 # Process breaths
-                processed_segment = self._silence_breaths(segment, adjusted_segments, silence_level)
+                processed_segment = self._silence_breaths(segment, breath_segments, silence_level)
                 
-                # Generate plot if requested
                 if plot:
                     self._plot_analysis(
                         segment,
-                        adjusted_segments,
+                        breath_segments,
                         str(Path(output_file).with_suffix('')) + f"_segment_{i+1}.png",
                         current_offset
                     )
@@ -176,11 +175,7 @@ class AudioProcessor:
                 processed_segments.append(processed_segment)
                 current_offset += len(segment) / sr
             
-            # Concatenate processed segments
             final_audio = np.concatenate(processed_segments)
-            
-            # Save output as WAV
-            logger.info(f"Saving processed audio to {output_file}...")
             sf.write(output_file, final_audio, sr)
             
             return True
@@ -201,31 +196,32 @@ class AudioProcessor:
         processed_audio = audio.copy()
         reduction_factor = 0 if silence_level == 'full' else (1 - silence_level/100)
         
-        # Debug logging - add this
-        logger.info(f"Processing {len(breath_segments)} breath segments with reduction factor {reduction_factor}")
-        
-        if not breath_segments:
-            return processed_audio
+        logger.debug(f"Processing {len(breath_segments)} breath segments with reduction factor {reduction_factor}")
         
         for start, end in breath_segments:
+            # Convert time to samples
             start_sample = int(start * self.sr)
-            end_sample = min(int(end * self.sr), len(processed_audio))
+            end_sample = int(end * self.sr)
             
             if start_sample >= end_sample or start_sample >= len(processed_audio):
+                logger.warning(f"Invalid segment {start:.3f}s-{end:.3f}s")
                 continue
+                
+            # Ensure we don't exceed array bounds
+            end_sample = min(end_sample, len(processed_audio))
             
-            fade_samples = min(int(0.01 * self.sr), (end_sample - start_sample) // 4)
+            # Calculate fade samples (10ms or quarter of segment length)
+            segment_length = end_sample - start_sample
+            fade_samples = min(int(0.01 * self.sr), segment_length // 4)
             
             if fade_samples > 0:
-                # Create fade curves
-                fade_out = np.linspace(1, reduction_factor, fade_samples)
-                fade_in = np.linspace(reduction_factor, 1, fade_samples)
-                
-                # Apply fades
                 try:
+                    # Create fade curves
+                    fade_out = np.linspace(1, reduction_factor, fade_samples)
+                    fade_in = np.linspace(reduction_factor, 1, fade_samples)
+                    
                     # Apply fade out
-                    if start_sample + fade_samples <= len(processed_audio):
-                        processed_audio[start_sample:start_sample + fade_samples] *= fade_out
+                    processed_audio[start_sample:start_sample + fade_samples] *= fade_out
                     
                     # Apply reduction to middle section
                     middle_start = start_sample + fade_samples
@@ -234,14 +230,12 @@ class AudioProcessor:
                         processed_audio[middle_start:middle_end] *= reduction_factor
                     
                     # Apply fade in
-                    if end_sample - fade_samples >= 0:
-                        processed_audio[end_sample - fade_samples:end_sample] *= fade_in
-                        
-                    # Debug logging - add this
-                    logger.info(f"Processed segment {start:.2f}s-{end:.2f}s")
+                    processed_audio[end_sample - fade_samples:end_sample] *= fade_in
+                    
+                    logger.debug(f"Processed breath segment {start:.3f}s-{end:.3f}s")
                     
                 except Exception as e:
-                    logger.warning(f"Error processing segment {start:.2f}s-{end:.2f}s: {str(e)}")
+                    logger.warning(f"Error processing segment {start:.3f}s-{end:.3f}s: {str(e)}")
                     continue
             else:
                 # Simple reduction for very short segments
