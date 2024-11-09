@@ -194,32 +194,55 @@ class AudioProcessor:
         breath_segments: List[Tuple[float, float]],
         silence_level: Union[str, int]
     ) -> np.ndarray:
+        """Silence or reduce volume of breath segments"""
         processed_audio = audio.copy()
         reduction_factor = 0 if silence_level == 'full' else (1 - silence_level/100)
         
-        for start, end in breath_segments:
-            start_sample = int(start * self.sr)
-            end_sample = int(end * self.sr)
+        # Skip processing if no valid breath segments
+        if not breath_segments:
+            return processed_audio
             
+        for start, end in breath_segments:
+            # Convert time to samples
+            start_sample = max(0, int(start * self.sr))
+            end_sample = min(len(processed_audio), int(end * self.sr))
+            
+            # Skip if segment is invalid
             if start_sample >= end_sample or start_sample >= len(processed_audio):
                 continue
                 
-            fade_samples = min(int(0.01 * self.sr), (end_sample - start_sample) // 4)
+            # Calculate fade length based on segment duration
+            segment_length = end_sample - start_sample
+            fade_samples = min(int(0.01 * self.sr), segment_length // 4)
             
-            if fade_samples > 0:
-                fade_out = np.linspace(1, reduction_factor, fade_samples)
-                fade_in = np.linspace(reduction_factor, 1, fade_samples)
+            # Skip if segment is too short for processing
+            if segment_length <= 2:
+                continue
                 
-                processed_audio[start_sample:start_sample + fade_samples] *= fade_out
-                
-                if start_sample + fade_samples < end_sample - fade_samples:
-                    processed_audio[start_sample + fade_samples:end_sample - fade_samples] *= reduction_factor
-                
-                if end_sample - fade_samples > start_sample:
-                    processed_audio[end_sample - fade_samples:end_sample] *= fade_in
-            else:
-                processed_audio[start_sample:end_sample] *= reduction_factor
-                
+            try:
+                if fade_samples > 0:
+                    # Create fade curves
+                    fade_out = np.linspace(1, reduction_factor, fade_samples)
+                    fade_in = np.linspace(reduction_factor, 1, fade_samples)
+                    
+                    # Apply fade out
+                    processed_audio[start_sample:start_sample + fade_samples] *= fade_out
+                    
+                    # Apply reduction to middle part if there is one
+                    if start_sample + fade_samples < end_sample - fade_samples:
+                        processed_audio[start_sample + fade_samples:end_sample - fade_samples] *= reduction_factor
+                    
+                    # Apply fade in
+                    if end_sample - fade_samples > start_sample:
+                        processed_audio[end_sample - fade_samples:end_sample] *= fade_in
+                else:
+                    # For very short segments, simple reduction
+                    processed_audio[start_sample:end_sample] *= reduction_factor
+                    
+            except ValueError as e:
+                logger.warning(f"Skipping problematic breath segment {start:.2f}s-{end:.2f}s: {str(e)}")
+                continue
+        
         return processed_audio
     
     def _plot_analysis(
