@@ -60,8 +60,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/lukaszliniewicz/breath-remove.git"
-"Bug Tracker" = "https://github.com/lukaszliniewicz/breath-remove.git/issues"
+"Homepage" = "https://github.com/lukaszliniewicz/breath-removal.git"
+"Bug Tracker" = "https://github.com/lukaszliniewicz/breath-removal.git/issues"
 
 [project.scripts]
 breath-removal = "breath_removal.cli:main"
