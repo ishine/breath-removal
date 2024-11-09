@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple, Union, Optional
 from intervaltree import Interval, IntervalTree
 import logging
+import torch
 
 logger = logging.getLogger(__name__)
 
