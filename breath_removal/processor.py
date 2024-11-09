@@ -57,55 +57,63 @@ class AudioProcessor:
         self,
         input_file: str,
         output_file: str,
+        max_minutes: float = 5.0,
+        sr: int = 22050,
+        channels: int = 1,
         silence_level: Union[str, int] = 'full',
         plot: bool = False
     ) -> bool:
         try:
             # Load audio
-            audio, _ = librosa.load(input_file, sr=self.sr, mono=(self.channels == 1))
+            audio, file_sr = librosa.load(input_file, sr=sr, mono=(channels == 1))
             
-            # Detect breaths
-            features, length = feature_extractor(audio)
-            features = features.to(self.detector.device)
-            length = length.to(self.detector.device)
+            # Split audio if needed
+            max_length = max_minutes * 60  # Convert to seconds
+            segments = split_audio(audio, sr, max_length)
+            logger.info(f"Processing {len(segments)} segments...")
             
-            with torch.no_grad():
-                output = self.detector.model(features, length)
-            
-            # Convert to breath segments
-            threshold = 0.064  # from original repo
-            prediction = (output[0] > threshold).nonzero().cpu().numpy()
-            
-            breath_segments = []
-            if len(prediction) > 0:
-                # Group consecutive frames into segments
-                breaks = np.where(np.diff(prediction[:, 0]) > 1)[0] + 1
-                segments = np.split(prediction[:, 0], breaks)
+            processed_segments = []
+            for i, segment in enumerate(segments):
+                logger.info(f"Processing segment {i+1}/{len(segments)}...")
                 
-                for segment in segments:
-                    if len(segment) > 20:  # minimum length threshold
-                        start = segment[0] * 0.01  # convert frame index to time
-                        end = segment[-1] * 0.01
-                        breath_segments.append((start, end))
+                # Process breath detection on segment
+                features, length = feature_extractor(segment)
+                features = features.to(self.detector.device)
+                length = length.to(self.detector.device)
+                
+                with torch.no_grad():
+                    output = self.detector.model(features, length)
+                
+                # Process breaths in segment
+                threshold = 0.064
+                prediction = (output[0] > threshold).nonzero().cpu().numpy()
+                
+                if len(prediction) > 0:
+                    # Group consecutive frames
+                    breaks = np.where(np.diff(prediction[:, 0]) > 1)[0] + 1
+                    breath_segments = np.split(prediction[:, 0], breaks)
+                    
+                    # Convert to time segments
+                    breath_times = []
+                    for breath_segment in breath_segments:
+                        if len(breath_segment) > 20:  # minimum length threshold
+                            start = breath_segment[0] * 0.01
+                            end = breath_segment[-1] * 0.01
+                            breath_times.append((start, end))
+                            
+                    # Process breaths
+                    segment = self._silence_breaths(segment, breath_times, silence_level)
+                    
+                processed_segments.append(segment)
+                
+            # Concatenate and save
+            final_audio = np.concatenate(processed_segments)
+            sf.write(output_file, final_audio, sr)
             
-            # Process breaths
-            if breath_segments:
-                processed_audio = self._silence_breaths(
-                    audio, breath_segments, silence_level
-                )
-            else:
-                processed_audio = audio
-            
-            # Generate plot if requested
-            if plot:
-                self._plot_analysis(audio, breath_segments, output_file)
-            
-            # Save processed audio
-            sf.write(output_file, processed_audio, self.sr)
             return True
             
         except Exception as e:
-            logger.error(f"Error processing file: {str(e)}")
+            logger.error(f"Error in process_file: {str(e)}")
             return False
     
     def _silence_breaths(
