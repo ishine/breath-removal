@@ -203,21 +203,18 @@ class BreathDetector:
 
     def detect_breaths(self, audio: np.ndarray, sr: int, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
         """Detect breath segments in audio array."""
-        # Create temporary 16kHz version for detection
+        # Resample to 16kHz for detection
         if sr != 16000:
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as temp_file:
-                # Save temporary file at 16kHz
-                temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-                feature, length = feature_extractor(temp_audio, sr=16000)
+            temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         else:
-            feature, length = feature_extractor(audio, sr=16000)
-            
+            temp_audio = audio
+
+        feature, length = feature_extractor(temp_audio, sr=16000)
         feature, length = feature.to(self.device), length.to(self.device)
         
         with torch.no_grad():
             output = self.model(feature, length)
         
-        # Process predictions
         prediction = (output[0] > threshold).nonzero().squeeze().tolist()
         tree = IntervalTree()
         
@@ -227,20 +224,23 @@ class BreathDetector:
             splits = np.split(prediction, splits)
             splits = list(filter(lambda split: len(split) > min_length, splits))
             
-            # Convert frame indices to time and create intervals
+            hop_length = int(16000 * 0.01)  # 10ms hop length at 16kHz
             for split in splits:
                 if len(split) > 0:
-                    # Convert frame indices to seconds, adjusting for original sample rate
-                    start_time = split[0] * 0.01 * (sr / 16000)
-                    end_time = split[-1] * 0.01 * (sr / 16000)
-                    if end_time > start_time:
-                        tree.add(Interval(
-                            round(start_time, 2),
-                            round(end_time, 2)
-                        ))
+                    # Convert frame indices to time in seconds
+                    start_time = split[0] * hop_length / 16000
+                    end_time = split[-1] * hop_length / 16000
+                    
+                    # Scale times to target sample rate
+                    start_time = start_time * (sr / 16000)
+                    end_time = end_time * (sr / 16000)
+                    
+                    tree.add(Interval(
+                        round(start_time, 3),
+                        round(end_time, 3)
+                    ))
         
         return tree
-
     def __call__(self, wav_path: str, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
         """Detect breaths in audio file."""
         # Load audio at its original sample rate
