@@ -8,6 +8,7 @@ import soundfile as sf
 import librosa
 from .detector import BreathDetector
 from .processor import AudioProcessor
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,25 +102,25 @@ def split_audio(audio: np.ndarray, sr: int, max_length: float) -> List[np.ndarra
 def main(input, output, model, sr, channels, silence, plot, max_minutes):
     """Remove breath sounds from audio files."""
     try:
+        # Create output folder if needed
+        output_folder = os.path.dirname(output) or '.'
+        os.makedirs(output_folder, exist_ok=True)
+        
         # Check CUDA availability
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {device}")
         
-        # Initialize detector
+        # Initialize detector and processor
         detector = BreathDetector(model_path=model, device=device)
+        processor = AudioProcessor(
+            detector=detector,
+            sr=sr,
+            channels=channels
+        )
         
         # Load audio
         logger.info("Loading audio file...")
-        audio, file_sr = sf.read(input)
-        if file_sr != sr:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=file_sr, target_sr=sr)
-        
-        # Convert to mono if needed
-        if len(audio.shape) > 1 and channels == 1:
-            audio = audio.mean(axis=1)
-        elif len(audio.shape) == 1 and channels == 2:
-            audio = np.stack([audio, audio])
+        audio, file_sr = librosa.load(input, sr=sr, mono=(channels == 1))
         
         # Split audio if needed
         max_length = max_minutes * 60  # Convert to seconds
@@ -130,21 +131,16 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
         processed_segments = []
         for i, segment in enumerate(segments):
             logger.info(f"Processing segment {i+1}/{len(segments)}...")
-            processor = AudioProcessor(
-                detector=detector,
-                sr=sr,
-                channels=channels
-            )
             
             # Save temporary segment
-            temp_file = f"temp_segment_{i}.wav"
+            temp_file = os.path.join(output_folder, f"temp_segment_{i}.wav")
             sf.write(temp_file, segment, sr)
             
             # Process segment
-            output_file = f"temp_output_{i}.wav"
+            temp_output = os.path.join(output_folder, f"temp_output_{i}.wav")
             success = processor.process_file(
                 input_file=temp_file,
-                output_file=output_file,
+                output_file=temp_output,
                 silence_level=silence,
                 plot=plot and i == 0  # Only plot first segment
             )
@@ -154,13 +150,12 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
                 return
                 
             # Read processed segment
-            processed_segment, _ = sf.read(output_file)
+            processed_segment, _ = sf.read(temp_output)
             processed_segments.append(processed_segment)
             
             # Clean up temporary files
-            import os
             os.remove(temp_file)
-            os.remove(output_file)
+            os.remove(temp_output)
         
         # Concatenate and save final result
         final_audio = np.concatenate(processed_segments)
@@ -171,3 +166,6 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}")
         raise click.ClickException(str(e))
+
+if __name__ == '__main__':
+    main()
