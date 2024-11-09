@@ -121,6 +121,7 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
         # Load audio
         logger.info("Loading audio file...")
         audio, file_sr = librosa.load(input, sr=sr, mono=(channels == 1))
+        logger.info(f"Loaded audio shape: {audio.shape}, sr: {file_sr}")
         
         # Split audio if needed
         max_length = max_minutes * 60  # Convert to seconds
@@ -131,10 +132,16 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
         processed_segments = []
         for i, segment in enumerate(segments):
             logger.info(f"Processing segment {i+1}/{len(segments)}...")
+            logger.info(f"Segment shape: {segment.shape}")
+            
+            if len(segment) == 0:
+                logger.warning(f"Skipping empty segment {i+1}")
+                continue
             
             # Save temporary segment
             temp_file = os.path.join(output_folder, f"temp_segment_{i}.wav")
             sf.write(temp_file, segment, sr)
+            logger.info(f"Saved temporary segment to {temp_file}")
             
             # Process segment
             temp_output = os.path.join(output_folder, f"temp_output_{i}.wav")
@@ -147,24 +154,47 @@ def main(input, output, model, sr, channels, silence, plot, max_minutes):
             
             if not success:
                 logger.error("Processing failed!")
+                if os.path.exists(temp_output):
+                    proc_seg, _ = sf.read(temp_output)
+                    logger.info(f"Processed segment shape: {proc_seg.shape}")
+                    
+                # Clean up temporary files
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
                 return
-                
+            
             # Read processed segment
             processed_segment, _ = sf.read(temp_output)
+            logger.info(f"Processed segment shape: {processed_segment.shape}")
             processed_segments.append(processed_segment)
             
             # Clean up temporary files
             os.remove(temp_file)
             os.remove(temp_output)
         
+        if not processed_segments:
+            logger.error("No segments were processed successfully")
+            return
+            
         # Concatenate and save final result
+        logger.info("Concatenating segments...")
+        processed_shapes = [seg.shape for seg in processed_segments]
+        logger.info(f"Shapes to concatenate: {processed_shapes}")
+        
         final_audio = np.concatenate(processed_segments)
+        logger.info(f"Final audio shape: {final_audio.shape}")
+        
         sf.write(output, final_audio, sr)
+        logger.info(f"Saved final audio to {output}")
         
         logger.info("Processing completed successfully!")
             
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise click.ClickException(str(e))
 
 if __name__ == '__main__':
