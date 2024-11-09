@@ -201,14 +201,11 @@ class BreathDetector:
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
 
-    def detect_breaths(self, audio: np.ndarray, sr: int, threshold: float = 0.064, min_length: int = 20) -> IntervalTree:
+    def detect_breaths(self, audio: np.ndarray, sr: int):
         """Detect breath segments in audio array."""
-        # Resample to 16kHz for detection
-        if sr != 16000:
-            temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-        else:
-            temp_audio = audio
-
+        # Always resample to 16kHz for detection
+        temp_audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        
         feature, length = feature_extractor(temp_audio, sr=16000)
         feature, length = feature.to(self.device), length.to(self.device)
         
@@ -227,13 +224,8 @@ class BreathDetector:
             hop_length = int(16000 * 0.01)  # 10ms hop length at 16kHz
             for split in splits:
                 if len(split) > 0:
-                    # Convert frame indices to time in seconds
-                    start_time = split[0] * hop_length / 16000
+                    start_time = split[0] * hop_length / 16000  # Convert to seconds
                     end_time = split[-1] * hop_length / 16000
-                    
-                    # Scale times to target sample rate
-                    start_time = start_time * (sr / 16000)
-                    end_time = end_time * (sr / 16000)
                     
                     tree.add(Interval(
                         round(start_time, 3),

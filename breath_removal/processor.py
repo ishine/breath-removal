@@ -179,18 +179,13 @@ class AudioProcessor:
             logger.error(traceback.format_exc())
             return False
 
-    def _silence_breaths(
-        self,
-        audio: np.ndarray,
-        breath_segments: List[Tuple[float, float]],
-        silence_level: Union[str, int]
-    ) -> np.ndarray:
+    def _silence_breaths(self, audio: np.ndarray, breath_segments: List[Tuple[float, float]], silence_level: Union[str, int]) -> np.ndarray:
         """Silence or reduce volume of breath segments."""
         processed_audio = audio.copy()
         reduction_factor = 0 if silence_level == 'full' else (1 - silence_level/100)
         
         for start, end in breath_segments:
-            # Convert time to samples within this segment
+            # Convert time to samples
             start_sample = int(start * self.sr)
             end_sample = int(end * self.sr)
             
@@ -205,11 +200,10 @@ class AudioProcessor:
             fade_samples = min(int(0.01 * self.sr), segment_length // 4)
             
             if fade_samples > 0:
-                # Create fade curves
+                # Create and apply fades
                 fade_out = np.linspace(1, reduction_factor, fade_samples)
                 fade_in = np.linspace(reduction_factor, 1, fade_samples)
                 
-                # Apply fades
                 processed_audio[start_sample:start_sample + fade_samples] *= fade_out
                 
                 if end_sample - fade_samples > start_sample + fade_samples:
@@ -217,12 +211,10 @@ class AudioProcessor:
                 
                 processed_audio[end_sample - fade_samples:end_sample] *= fade_in
                 
-                logger.debug(f"Processed breath at {start:.3f}s-{end:.3f}s")
             else:
                 processed_audio[start_sample:end_sample] *= reduction_factor
         
-        return processed_audio
-            
+        return processed_audio            
     def _plot_analysis(
         self,
         audio: np.ndarray,
