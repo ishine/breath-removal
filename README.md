@@ -1,4 +1,4 @@
-# breath-remove
+# breath-removal
 
 A command-line tool for detecting and removing breath sounds from audio files. This tool leverages the Respiro-en model, introduced in the paper "[Frame-Wise Breath Detection with Self-Training: An Exploration of Enhancing Breath Naturalness in Text-to-Speech](https://arxiv.org/abs/2402.00288)" by Dong Yang,  Yuxuan Wang,  Jiatong Shi,  Xin Yuan,  Lei Xie, and  Xunying Liu. The original Respiro-en model and code can be found [here](https://github.com/ydqmkkx/Breath-Detection).
 
@@ -13,7 +13,7 @@ pip install git+https://github.com/lukaszliniewicz/breath-remove.git
 
 ## Usage
 
-The `breath-remove` tool is invoked from the command line:
+The `breath-removal` tool is invoked from the command line:
 
 ```bash
 breath-removal -i <input_audio_file> -o <output_folder> [options]
